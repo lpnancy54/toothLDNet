@@ -15,10 +15,28 @@ Les points détectés peuvent ensuite être exportés en JSON.
 from __future__ import annotations
 
 import json
+import importlib.util
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+
+def ensure_dependencies() -> None:
+    """Vérifie les dépendances et affiche une aide claire si elles manquent."""
+    required = ("numpy", "trimesh", "matplotlib")
+    missing = [name for name in required if importlib.util.find_spec(name) is None]
+    if missing:
+        packages = " ".join(missing)
+        print(
+            "Dépendances manquantes pour lancer la GUI.\n"
+            f"Installez-les avec: pip install {packages}\n"
+            "Puis relancez: python stl_tooth_detection_gui.py"
+        )
+        raise SystemExit(1)
+
+
+ensure_dependencies()
 
 import numpy as np
 import trimesh
