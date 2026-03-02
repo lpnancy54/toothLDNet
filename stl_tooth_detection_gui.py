@@ -17,6 +17,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import tkinter as tk
+from tkinter import filedialog, ttk
 
 
 def ensure_dependencies() -> None:
@@ -97,6 +99,14 @@ def peak_indices(signal: np.ndarray, n_peaks: int) -> np.ndarray:
 
 
 def detect_teeth_landmarks(vertices: np.ndarray, jaw: str, n_teeth: int = 16) -> np.ndarray:
+    """Initialisation heuristique des landmarks dentaires sur STL IOS.
+
+    Améliorations:
+    - repère local PCA,
+    - filtre occlusal,
+    - bins réguliers gauche->droite (plus stables que quantiles),
+    - score privilégiant cuspides/zone externe de l'arcade.
+    """
     if len(vertices) < n_teeth:
         raise ValueError("Le maillage contient trop peu de points pour détecter les dents.")
 
@@ -105,69 +115,48 @@ def detect_teeth_landmarks(vertices: np.ndarray, jaw: str, n_teeth: int = 16) ->
     depth = centered @ axis_depth
     height = centered @ axis_height
 
-    # Garde surtout la zone occlusale pour limiter les faux points sur gencive.
+    # Bande occlusale (évite gencive/palais/plancher buccal).
     if jaw == "maxillaire":
-        h_cut = np.quantile(height, 0.65)
-        occ = height >= h_cut
+        occ = height >= np.quantile(height, 0.62)
     else:
-        h_cut = np.quantile(height, 0.35)
-        occ = height <= h_cut
-
-    if occ.sum() < n_teeth * 20:
+        occ = height <= np.quantile(height, 0.38)
+    if occ.sum() < n_teeth * 40:
         occ = np.ones(len(vertices), dtype=bool)
 
-    occ_arch = arch[occ]
-
-    # Histogramme lissé + pics de densité pour mieux approximer les centres dentaires.
-    hist, edges = np.histogram(occ_arch, bins=max(64, n_teeth * 8))
-    hist_s = moving_average(hist.astype(float), 7)
-    peaks = peak_indices(hist_s, n_teeth)
-
-    if len(peaks) >= max(4, n_teeth // 2):
-        centers_1d = 0.5 * (edges[peaks] + edges[peaks + 1])
-        centers_1d = np.sort(centers_1d)
-        # Si trop de pics, sous-échantillonne régulièrement.
-        if len(centers_1d) > n_teeth:
-            idx = np.linspace(0, len(centers_1d) - 1, n_teeth).round().astype(int)
-            centers_1d = centers_1d[idx]
-        # Si pas assez, complète par quantiles.
-        elif len(centers_1d) < n_teeth:
-            qfill = np.quantile(occ_arch, np.linspace(0.0, 1.0, n_teeth))
-            mix = np.unique(np.concatenate([centers_1d, qfill]))
-            idx = np.linspace(0, len(mix) - 1, n_teeth).round().astype(int)
-            centers_1d = mix[idx]
-        bin_centers = centers_1d
-    else:
-        bin_centers = np.quantile(occ_arch, np.linspace(0.0, 1.0, n_teeth))
+    # Bins réguliers sur l'axe arcade: robustes aux densités non uniformes.
+    a_min, a_max = float(arch[occ].min()), float(arch[occ].max())
+    edges = np.linspace(a_min, a_max, n_teeth + 1)
 
     landmarks: list[np.ndarray] = []
-    span = max(1e-6, (arch.max() - arch.min()) / (n_teeth * 2.5))
+    for i in range(n_teeth):
+        lo, hi = edges[i], edges[i + 1]
+        in_bin = occ & (arch >= lo) & (arch <= hi if i == n_teeth - 1 else arch < hi)
+        if in_bin.sum() < 30:
+            in_bin = (arch >= lo) & (arch <= hi if i == n_teeth - 1 else arch < hi)
 
-    for c in bin_centers:
-        local = np.abs(arch - c) <= span
-        if local.sum() < 50:
-            local = np.abs(arch - c) <= span * 1.8
-        if local.sum() == 0:
-            nearest = np.argmin(np.abs(arch - c))
-            landmarks.append(vertices[nearest])
+        if in_bin.sum() == 0:
+            idx = int(np.argmin(np.abs(arch - (lo + hi) * 0.5)))
+            landmarks.append(vertices[idx])
             continue
 
-        # Préfère les sommets les plus occlusaux dans la fenêtre locale.
-        h_local = height[local]
-        d_local = np.abs(depth[local])
-        pts_local = vertices[local]
+        pts = vertices[in_bin]
+        h = height[in_bin]
+        d = np.abs(depth[in_bin])
 
+        # Score: occlusal + externe (|depth| élevé), ce qui évite les points "au milieu".
         if jaw == "maxillaire":
-            h_rank = h_local
+            h_term = h
         else:
-            h_rank = -h_local
+            h_term = -h
 
-        # Score: occlusal élevé + proche de la crête centrale (|depth| faible)
-        score = h_rank - 0.35 * d_local
-        best = np.argmax(score)
-        landmarks.append(pts_local[best])
+        score = 0.70 * h_term + 0.30 * d
+        best = int(np.argmax(score))
+        landmarks.append(pts[best])
 
-    return np.asarray(landmarks)
+    det = np.asarray(landmarks)
+    # Ordre gauche->droite cohérent pour labels.
+    proj = (det - vertices.mean(axis=0, keepdims=True)) @ axis_arch
+    return det[np.argsort(proj)]
 
 
 def fdi_labels(jaw: str, n_teeth: int) -> list[str]:
@@ -185,27 +174,34 @@ class ToothDetectionApp:
         self.current_jaw = "maxillaire"
         self.n_teeth = 16
 
-        self.plotter = pv.Plotter(title="Tooth STL Detection - PyVista", window_size=(1450, 900))
+        self.plotter = pv.Plotter(title="Tooth STL Detection - PyVista", window_size=(1300, 860))
         self.plotter.enable_anti_aliasing("ssaa")
         self.plotter.add_axes()
-        self.plotter.set_background("#101820")
+        self.plotter.set_background("#0f172a")
 
         self.mesh_actor: Any = None
         self.points_actor: Any = None
         self.label_actor: Any = None
         self.info_actor: Any = None
 
+        self.root = tk.Tk()
+        self.root.title("Contrôle import STL / landmarks")
+        self.root.geometry("430x380")
+        self.status_var = tk.StringVar(value="Chargez un STL maxillaire ou mandibulaire.")
+        self.jaw_var = tk.StringVar(value=self.current_jaw)
+        self.teeth_var = tk.IntVar(value=self.n_teeth)
+
+        self._build_control_panel()
         self._add_ui()
         self._refresh_scene()
 
     def _add_ui(self) -> None:
         self.plotter.add_text(
-            "Raccourcis: M=load max | N=load mand | J=switch jaw | D=detect | C=clear | E=export | +/- teeth | P=pick",
+            "Raccourcis: M=load max | N=load mand | J=switch jaw | D=detect | C=clear | E=export | +/- teeth | clic=ajuster",
             position="upper_left",
             font_size=10,
             color="white",
         )
-
         self.plotter.add_key_event("m", lambda: self.load_stl("maxillaire"))
         self.plotter.add_key_event("n", lambda: self.load_stl("mandibulaire"))
         self.plotter.add_key_event("j", self.switch_jaw)
@@ -218,33 +214,61 @@ class ToothDetectionApp:
         self.plotter.enable_point_picking(
             callback=self._on_pick,
             use_picker=True,
-            show_message="Mode précision: cliquez sur la dent pour remplacer le landmark le plus proche.",
+            show_message="Cliquez sur la dent pour corriger le landmark le plus proche.",
             color="yellow",
             point_size=14,
             pickable_window=False,
             left_clicking=True,
         )
 
+    def _build_control_panel(self) -> None:
+        frm = ttk.Frame(self.root, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frm, text="Arcade active:").pack(anchor="w")
+        jaw_box = ttk.Combobox(frm, textvariable=self.jaw_var, values=["maxillaire", "mandibulaire"], state="readonly")
+        jaw_box.pack(fill=tk.X, pady=(2, 8))
+        jaw_box.bind("<<ComboboxSelected>>", lambda _e: self._set_jaw_from_ui())
+
+        row = ttk.Frame(frm)
+        row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(row, text="Charger maxillaire", command=lambda: self.load_stl("maxillaire")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        ttk.Button(row, text="Charger mandibulaire", command=lambda: self.load_stl("mandibulaire")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
+
+        ttk.Label(frm, text="Nombre de dents:").pack(anchor="w")
+        sp = ttk.Spinbox(frm, from_=8, to=32, textvariable=self.teeth_var, width=8, command=self._set_teeth_from_ui)
+        sp.pack(anchor="w", pady=(2, 10))
+
+        row2 = ttk.Frame(frm)
+        row2.pack(fill=tk.X, pady=(0, 10))
+        ttk.Button(row2, text="Détecter", command=self.run_detection).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
+        ttk.Button(row2, text="Effacer", command=self.clear_detection).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
+        ttk.Button(row2, text="Exporter JSON", command=self.export_json).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
+
+        ttk.Label(frm, textvariable=self.status_var, wraplength=390, foreground="#1f2937").pack(anchor="w", pady=(8, 0))
+
+    def _set_jaw_from_ui(self) -> None:
+        self.current_jaw = self.jaw_var.get()
+        self._refresh_scene(f"Arcade active: {self.current_jaw}")
+
+    def _set_teeth_from_ui(self) -> None:
+        self.set_n_teeth(int(self.teeth_var.get()))
+
     def set_n_teeth(self, value: int) -> None:
         self.n_teeth = int(np.clip(value, 8, 32))
+        self.teeth_var.set(self.n_teeth)
         self._refresh_scene(f"Nombre de dents = {self.n_teeth}")
 
     def switch_jaw(self) -> None:
         self.current_jaw = "mandibulaire" if self.current_jaw == "maxillaire" else "maxillaire"
+        self.jaw_var.set(self.current_jaw)
         self._refresh_scene(f"Arcade active: {self.current_jaw}")
 
     def _pick_file(self, jaw: str) -> str | None:
-        # Tkinter uniquement pour file dialog natif (pas d'UI principale Tkinter).
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
         path = filedialog.askopenfilename(
             title=f"Sélectionner STL {jaw}",
             filetypes=[("STL files", "*.stl"), ("Tous les fichiers", "*.*")],
         )
-        root.destroy()
         return path or None
 
     def load_stl(self, jaw: str) -> None:
@@ -264,6 +288,7 @@ class ToothDetectionApp:
             faces=np.asarray(mesh.faces),
         )
         self.current_jaw = jaw
+        self.jaw_var.set(jaw)
         self._refresh_scene(f"Chargé {jaw}: {Path(path).name}")
 
     def run_detection(self) -> None:
@@ -319,17 +344,11 @@ class ToothDetectionApp:
         self._refresh_scene("Landmark ajusté manuellement (point-picking).")
 
     def _save_file(self) -> str | None:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
         out = filedialog.asksaveasfilename(
             title="Exporter les détections",
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
         )
-        root.destroy()
         return out or None
 
     def export_json(self) -> None:
@@ -366,6 +385,7 @@ class ToothDetectionApp:
         ]
         if status:
             info.append(status)
+            self.status_var.set(status)
 
         mesh = self.meshes.get(self.current_jaw)
         if mesh is not None:
@@ -414,7 +434,18 @@ class ToothDetectionApp:
         self.plotter.render()
 
     def run(self) -> None:
-        self.plotter.show()
+        self.plotter.show(interactive_update=True, auto_close=False)
+        while self.plotter.app_window is not None and not self.plotter._closed:
+            try:
+                self.root.update_idletasks()
+                self.root.update()
+            except tk.TclError:
+                break
+            self.plotter.update()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
 
 def main() -> None:
