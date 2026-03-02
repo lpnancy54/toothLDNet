@@ -101,11 +101,11 @@ def peak_indices(signal: np.ndarray, n_peaks: int) -> np.ndarray:
 def detect_teeth_landmarks(vertices: np.ndarray, jaw: str, n_teeth: int = 16) -> np.ndarray:
     """Initialisation heuristique des landmarks dentaires sur STL IOS.
 
-    Améliorations:
+    Stratégie mise à jour pour éviter les points sur la face interne (palatin/lingual):
     - repère local PCA,
-    - filtre occlusal,
-    - bins réguliers gauche->droite (plus stables que quantiles),
-    - score privilégiant cuspides/zone externe de l'arcade.
+    - filtre occlusal plus strict,
+    - segmentation selon quantiles sur l'axe arcade,
+    - dans chaque segment: priorité à la zone occlusale + externe (radiale/buccale).
     """
     if len(vertices) < n_teeth:
         raise ValueError("Le maillage contient trop peu de points pour détecter les dents.")
@@ -114,24 +114,35 @@ def detect_teeth_landmarks(vertices: np.ndarray, jaw: str, n_teeth: int = 16) ->
     arch = centered @ axis_arch
     depth = centered @ axis_depth
     height = centered @ axis_height
+    radial = np.linalg.norm(centered[:, :2], axis=1)
 
-    # Bande occlusale (évite gencive/palais/plancher buccal).
+    # Filtre occlusal plus strict pour éviter palais/plancher.
     if jaw == "maxillaire":
-        occ = height >= np.quantile(height, 0.62)
+        occ = height >= np.quantile(height, 0.72)
+        h_dir = 1.0
     else:
-        occ = height <= np.quantile(height, 0.38)
-    if occ.sum() < n_teeth * 40:
+        occ = height <= np.quantile(height, 0.28)
+        h_dir = -1.0
+
+    if occ.sum() < n_teeth * 50:
+        # fallback progressif si scan incomplet.
+        if jaw == "maxillaire":
+            occ = height >= np.quantile(height, 0.62)
+        else:
+            occ = height <= np.quantile(height, 0.38)
+    if occ.sum() < n_teeth * 30:
         occ = np.ones(len(vertices), dtype=bool)
 
-    # Bins réguliers sur l'axe arcade: robustes aux densités non uniformes.
-    a_min, a_max = float(arch[occ].min()), float(arch[occ].max())
-    edges = np.linspace(a_min, a_max, n_teeth + 1)
+    occ_arch = arch[occ]
+    # Quantiles => plus robuste que min/max aux extrêmes aberrants.
+    edges = np.quantile(occ_arch, np.linspace(0.0, 1.0, n_teeth + 1))
 
     landmarks: list[np.ndarray] = []
     for i in range(n_teeth):
         lo, hi = edges[i], edges[i + 1]
-        in_bin = occ & (arch >= lo) & (arch <= hi if i == n_teeth - 1 else arch < hi)
-        if in_bin.sum() < 30:
+        in_bin = (arch >= lo) & (arch <= hi if i == n_teeth - 1 else arch < hi)
+        in_bin &= occ
+        if in_bin.sum() < 40:
             in_bin = (arch >= lo) & (arch <= hi if i == n_teeth - 1 else arch < hi)
 
         if in_bin.sum() == 0:
@@ -140,16 +151,19 @@ def detect_teeth_landmarks(vertices: np.ndarray, jaw: str, n_teeth: int = 16) ->
             continue
 
         pts = vertices[in_bin]
-        h = height[in_bin]
+        h = height[in_bin] * h_dir
+        r = radial[in_bin]
         d = np.abs(depth[in_bin])
 
-        # Score: occlusal + externe (|depth| élevé), ce qui évite les points "au milieu".
-        if jaw == "maxillaire":
-            h_term = h
-        else:
-            h_term = -h
+        # Garde la partie la plus occlusale localement, puis prend le plus externe.
+        h_cut = np.quantile(h, 0.65)
+        top = h >= h_cut
+        if top.sum() < 5:
+            top = h >= np.quantile(h, 0.5)
 
-        score = 0.70 * h_term + 0.30 * d
+        score = 0.55 * h + 0.35 * r + 0.10 * d
+        score = np.where(top, score, score - 1e6)
+
         best = int(np.argmax(score))
         landmarks.append(pts[best])
 
