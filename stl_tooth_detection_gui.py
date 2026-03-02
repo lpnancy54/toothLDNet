@@ -101,11 +101,10 @@ def peak_indices(signal: np.ndarray, n_peaks: int) -> np.ndarray:
 def detect_teeth_landmarks(vertices: np.ndarray, jaw: str, n_teeth: int = 16) -> np.ndarray:
     """Initialisation heuristique des landmarks dentaires sur STL IOS.
 
-    Stratégie mise à jour pour éviter les points sur la face interne (palatin/lingual):
-    - repère local PCA,
-    - filtre occlusal plus strict,
-    - segmentation selon quantiles sur l'axe arcade,
-    - dans chaque segment: priorité à la zone occlusale + externe (radiale/buccale).
+    Correctifs:
+    - suppression du socle (plan de base) via histogramme de hauteur,
+    - choix automatique du côté occlusal (haut/bas) selon la géométrie,
+    - sélection par segment avec contrainte occlusale + externe.
     """
     if len(vertices) < n_teeth:
         raise ValueError("Le maillage contient trop peu de points pour détecter les dents.")
@@ -114,73 +113,85 @@ def detect_teeth_landmarks(vertices: np.ndarray, jaw: str, n_teeth: int = 16) ->
     arch = centered @ axis_arch
     depth = centered @ axis_depth
     height = centered @ axis_height
+    radial = np.linalg.norm(centered[:, :2], axis=1)
 
-    # Filtre occlusal plus strict pour éviter palais/plancher.
-    if jaw == "maxillaire":
-        occ = height >= np.quantile(height, 0.72)
-        h_dir = 1.0
+    # Détection côté socle (fort pic de densité à une extrémité de hauteur).
+    hist, _ = np.histogram(height, bins=80)
+    med = max(1.0, float(np.median(hist)))
+    base_side: str | None = None
+    if hist[0] > 1.6 * med and hist[0] > 1.3 * hist[-1]:
+        base_side = "low"
+    elif hist[-1] > 1.6 * med and hist[-1] > 1.3 * hist[0]:
+        base_side = "high"
+
+    if base_side == "low":
+        non_base = height >= np.quantile(height, 0.10)
+    elif base_side == "high":
+        non_base = height <= np.quantile(height, 0.90)
     else:
-        occ = height <= np.quantile(height, 0.28)
-        h_dir = -1.0
+        non_base = np.ones(len(vertices), dtype=bool)
 
-    if occ.sum() < n_teeth * 50:
-        # fallback progressif si scan incomplet.
+    # Choix automatique du sens occlusal: côté qui présente la plus grande expansion radiale.
+    top_mask = non_base & (height >= np.quantile(height[non_base], 0.80))
+    bot_mask = non_base & (height <= np.quantile(height[non_base], 0.20))
+    top_rad = float(np.mean(radial[top_mask])) if top_mask.any() else -1e9
+    bot_rad = float(np.mean(radial[bot_mask])) if bot_mask.any() else -1e9
+
+    if top_rad >= bot_rad:
+        h_dir = 1.0
+        occ = non_base & (height >= np.quantile(height[non_base], 0.65))
+    else:
+        h_dir = -1.0
+        occ = non_base & (height <= np.quantile(height[non_base], 0.35))
+
+    # fallback par arcade si trop peu de points.
+    if occ.sum() < n_teeth * 40:
         if jaw == "maxillaire":
-            occ = height >= np.quantile(height, 0.62)
+            occ = non_base & (height >= np.quantile(height[non_base], 0.58))
+            h_dir = 1.0
         else:
-            occ = height <= np.quantile(height, 0.38)
-    if occ.sum() < n_teeth * 30:
-        occ = np.ones(len(vertices), dtype=bool)
+            occ = non_base & (height <= np.quantile(height[non_base], 0.42))
+            h_dir = -1.0
+    if occ.sum() < n_teeth * 25:
+        occ = non_base
 
     occ_arch = arch[occ]
-    # Quantiles => plus robuste que min/max aux extrêmes aberrants.
     edges = np.quantile(occ_arch, np.linspace(0.0, 1.0, n_teeth + 1))
 
     landmarks: list[np.ndarray] = []
     for i in range(n_teeth):
         lo, hi = edges[i], edges[i + 1]
-        in_bin = (arch >= lo) & (arch <= hi if i == n_teeth - 1 else arch < hi)
-        in_bin &= occ
-        if in_bin.sum() < 40:
-            in_bin = (arch >= lo) & (arch <= hi if i == n_teeth - 1 else arch < hi)
+        in_bin = occ & (arch >= lo) & (arch <= hi if i == n_teeth - 1 else arch < hi)
+        if in_bin.sum() < 35:
+            in_bin = non_base & (arch >= lo) & (arch <= hi if i == n_teeth - 1 else arch < hi)
 
         if in_bin.sum() == 0:
-            idx = int(np.argmin(np.abs(arch - (lo + hi) * 0.5)))
+            idx = int(np.argmin(np.abs(arch - 0.5 * (lo + hi))))
             landmarks.append(vertices[idx])
             continue
 
         pts = vertices[in_bin]
         h = height[in_bin] * h_dir
         d = np.abs(depth[in_bin])
+        a = arch[in_bin]
 
-        # 1) conserve les sommets les plus occlusaux localement
-        h_cut = np.quantile(h, 0.60)
-        sel = h >= h_cut
-        if sel.sum() < 8:
-            sel = h >= np.quantile(h, 0.50)
+        h_sel = h >= np.quantile(h, 0.60)
+        if h_sel.sum() < 8:
+            h_sel = h >= np.quantile(h, 0.50)
 
-        # 2) parmi ces candidats, favorise la zone externe buccale/labiale
-        d_sel = d[sel]
-        outer_cut = np.quantile(d_sel, 0.60) if len(d_sel) > 0 else np.quantile(d, 0.60)
-        outer = d >= outer_cut
+        d_sel = d >= np.quantile(d, 0.55)
+        center_penalty = np.abs(a - 0.5 * (lo + hi))
 
-        # 3) critère final: rester occlusal + externe tout en restant proche du centre du segment
-        arch_local = arch[in_bin]
-        c_mid = 0.5 * (lo + hi)
-        center_penalty = np.abs(arch_local - c_mid)
+        score = 0.62 * h + 0.30 * d - 0.22 * center_penalty
+        final = h_sel & d_sel
+        if final.sum() >= 3:
+            score = np.where(final, score, score - 1e6)
+        elif h_sel.sum() >= 3:
+            score = np.where(h_sel, score, score - 1e6)
 
-        score = 0.60 * h + 0.35 * d - 0.20 * center_penalty
-        mask_final = sel & outer
-        if mask_final.sum() >= 3:
-            score = np.where(mask_final, score, score - 1e6)
-        elif sel.sum() >= 3:
-            score = np.where(sel, score, score - 1e6)
-
-        best = int(np.argmax(score))
-        landmarks.append(pts[best])
+        landmarks.append(pts[int(np.argmax(score))])
 
     det = np.asarray(landmarks)
-    # Ordre gauche->droite cohérent pour labels.
     proj = (det - vertices.mean(axis=0, keepdims=True)) @ axis_arch
     return det[np.argsort(proj)]
 
@@ -336,40 +347,46 @@ class ToothDetectionApp:
         self.detections[self.current_jaw] = None
         self._refresh_scene(f"Détections effacées ({self.current_jaw}).")
 
-    def _on_pick(self, picked: Any, *_: Any) -> None:
+    def _on_pick(self, *args: Any) -> None:
+        """Compatibilité PyVista: callback peut recevoir (point) ou (point, picker)."""
+        picked = None
+        for a in args:
+            arr = np.asarray(a) if a is not None else None
+            if arr is not None and arr.size >= 3 and np.issubdtype(arr.dtype, np.number):
+                picked = arr.ravel()[:3]
+                break
         if picked is None:
             return
+
         mesh = self.meshes.get(self.current_jaw)
         if mesh is None:
             return
 
-        p = np.asarray(picked)
-        if p.ndim > 1:
-            p = p.ravel()[:3]
-        if p.shape != (3,):
-            return
+        p = picked.astype(float)
 
-        if self.detections[self.current_jaw] is None:
-            self.detections[self.current_jaw] = np.empty((0, 3), dtype=float)
+        # Snap au sommet STL le plus proche pour rester sur la surface réelle.
+        idx_v = int(np.argmin(np.sum((mesh.vertices - p) ** 2, axis=1)))
+        p = mesh.vertices[idx_v]
+
+        if self.detections[self.current_jaw] is None or len(self.detections[self.current_jaw]) == 0:
+            self.detections[self.current_jaw] = np.array([p], dtype=float)
+            self._refresh_scene("Landmark ajouté (clic).")
+            return
 
         det = self.detections[self.current_jaw]
         assert det is not None
 
-        if len(det) == 0:
-            det = np.array([p], dtype=float)
-        elif len(det) < self.n_teeth:
-            det = np.vstack([det, p])
-        else:
-            idx = np.argmin(np.sum((det - p) ** 2, axis=1))
-            det[idx] = p
+        # Ajustement = remplacement du point le plus proche.
+        idx = int(np.argmin(np.sum((det - p) ** 2, axis=1)))
+        det[idx] = p
 
         # Re-ordonne gauche->droite dans l'axe arcade pour garder les labels cohérents.
-        centered, axis_arch, _, _ = compute_local_frame(mesh.vertices)
+        _, axis_arch, _, _ = compute_local_frame(mesh.vertices)
         proj = (det - mesh.vertices.mean(axis=0, keepdims=True)) @ axis_arch
-        order = np.argsort(proj)
-        self.detections[self.current_jaw] = det[order]
+        self.detections[self.current_jaw] = det[np.argsort(proj)]
 
-        self._refresh_scene("Landmark ajusté manuellement (point-picking).")
+        self._refresh_scene("Landmark ajusté manuellement (clic).")
+
 
     def _save_file(self) -> str | None:
         out = filedialog.asksaveasfilename(
