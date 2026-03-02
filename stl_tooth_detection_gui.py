@@ -114,7 +114,6 @@ def detect_teeth_landmarks(vertices: np.ndarray, jaw: str, n_teeth: int = 16) ->
     arch = centered @ axis_arch
     depth = centered @ axis_depth
     height = centered @ axis_height
-    radial = np.linalg.norm(centered[:, :2], axis=1)
 
     # Filtre occlusal plus strict pour éviter palais/plancher.
     if jaw == "maxillaire":
@@ -152,17 +151,30 @@ def detect_teeth_landmarks(vertices: np.ndarray, jaw: str, n_teeth: int = 16) ->
 
         pts = vertices[in_bin]
         h = height[in_bin] * h_dir
-        r = radial[in_bin]
         d = np.abs(depth[in_bin])
 
-        # Garde la partie la plus occlusale localement, puis prend le plus externe.
-        h_cut = np.quantile(h, 0.65)
-        top = h >= h_cut
-        if top.sum() < 5:
-            top = h >= np.quantile(h, 0.5)
+        # 1) conserve les sommets les plus occlusaux localement
+        h_cut = np.quantile(h, 0.60)
+        sel = h >= h_cut
+        if sel.sum() < 8:
+            sel = h >= np.quantile(h, 0.50)
 
-        score = 0.55 * h + 0.35 * r + 0.10 * d
-        score = np.where(top, score, score - 1e6)
+        # 2) parmi ces candidats, favorise la zone externe buccale/labiale
+        d_sel = d[sel]
+        outer_cut = np.quantile(d_sel, 0.60) if len(d_sel) > 0 else np.quantile(d, 0.60)
+        outer = d >= outer_cut
+
+        # 3) critère final: rester occlusal + externe tout en restant proche du centre du segment
+        arch_local = arch[in_bin]
+        c_mid = 0.5 * (lo + hi)
+        center_penalty = np.abs(arch_local - c_mid)
+
+        score = 0.60 * h + 0.35 * d - 0.20 * center_penalty
+        mask_final = sel & outer
+        if mask_final.sum() >= 3:
+            score = np.where(mask_final, score, score - 1e6)
+        elif sel.sum() >= 3:
+            score = np.where(sel, score, score - 1e6)
 
         best = int(np.argmax(score))
         landmarks.append(pts[best])
@@ -324,7 +336,7 @@ class ToothDetectionApp:
         self.detections[self.current_jaw] = None
         self._refresh_scene(f"Détections effacées ({self.current_jaw}).")
 
-    def _on_pick(self, picked: Any) -> None:
+    def _on_pick(self, picked: Any, *_: Any) -> None:
         if picked is None:
             return
         mesh = self.meshes.get(self.current_jaw)
@@ -332,6 +344,8 @@ class ToothDetectionApp:
             return
 
         p = np.asarray(picked)
+        if p.ndim > 1:
+            p = p.ravel()[:3]
         if p.shape != (3,):
             return
 
