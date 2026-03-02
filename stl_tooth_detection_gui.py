@@ -435,11 +435,14 @@ class ToothDetectionApp:
 
     def run(self) -> None:
         self.plotter.show(interactive_update=True, auto_close=False)
-        while self.plotter.app_window is not None and not self.plotter._closed:
+        while not getattr(self.plotter, "_closed", False):
             try:
                 self.root.update_idletasks()
                 self.root.update()
             except tk.TclError:
+                break
+            # Selon la version PyVista, la fenêtre VTK peut disparaître sans app_window.
+            if getattr(self.plotter, "ren_win", None) is None:
                 break
             self.plotter.update()
         try:
